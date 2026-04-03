@@ -20,3 +20,4 @@ unsloth_compiled_cache
 models/qwen3.5/supervised-learning/16-32-0.05
 models/deepseek/supervised-learning/16-32-0.05-4bit
 .claude
+environment.yml

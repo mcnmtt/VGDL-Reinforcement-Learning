@@ -1,14 +1,11 @@
 """
-GRPO (Group Relative Policy Optimization) training for VGDL generation.
+GRPO training per generazione VGDL.
 
-Parte dal modello Qwen3.5-4B fine-tunato con SFT e lo allena con segnali di reward
-basati su:
+Parte dal modello Qwen3.5-4B fine-tunato con SFT e lo allena con reward basate su:
   - Eseguibilità VGDL (parser py-vgdl)
   - Struttura corretta (4 sezioni obbligatorie + BasicGame)
-  - Classi sprite valide (ontologia py-vgdl)
-  - Effetti di interazione validi (ontologia py-vgdl)
-  - Condizioni di terminazione valide (ontologia py-vgdl)
-  - Uso di EOS al posto di keyword di bordo non valide
+  - Classi sprite, effetti e condizioni di terminazione validi
+  - Uso corretto di EOS per i bordi dello schermo
 
 Eseguire dalla root del progetto:
   python models/qwen3.5/reinforcement-learning/grpo_train.py
@@ -16,25 +13,28 @@ Eseguire dalla root del progetto:
 
 import sys
 import os
+# Deve essere impostato PRIMA di qualsiasi import di torch/unsloth,
+# altrimenti torch si inizializza senza il flag e inductor tenta di
+# compilare kernel Triton cercando un compilatore C (non disponibile in WSL).
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
+os.environ["TORCHINDUCTOR_DISABLE"] = "1"
+
+from unsloth import FastLanguageModel
 import json
 import torch
+from tqdm import tqdm
+from transformers import TrainerCallback
 
-# Aggiunge py-vgdl al path (relativo alla root del progetto)
 _REPO_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "..")
 sys.path.insert(0, os.path.join(_REPO_ROOT, "py-vgdl"))
 
-from unsloth import FastLanguageModel
 from datasets import load_from_disk
 from trl import GRPOTrainer, GRPOConfig
-# NON usare PeftModel.from_pretrained: bypassa il pipeline di unsloth e
-# causa conflitti con il forward compilato (TorchRuntimeError in rotary emb)
+from reward_functions import REWARD_FUNCTIONS
 
-from reward_functions import REWARD_FUNCTIONS  # noqa: E402
 
-# ========================
-# Config
-# ========================
+# ── Configurazione ────────────────────────────────────────────────────────────
+
 BASE_MODEL  = "Qwen/Qwen3.5-4B"
 SFT_ADAPTER = "models/qwen3.5/supervised-learning/16-32-0.05"
 OUTPUT_DIR  = "models/qwen3.5/reinforcement-learning/grpo-output"
@@ -48,31 +48,26 @@ SYSTEM_PROMPT = (
 )
 
 
-# ========================
-# Model Loading
-# unsloth from_pretrained con un adapter path carica base model + applica il LoRA SFT
-# (lo mantiene come adapter attivo, non lo mergia).
-# Non serve FastLanguageModel.get_peft_model: il LoRA SFT è già presente.
-# Basta rendere trainable i parametri LoRA per il GRPO.
-# ========================
-print(f"Loading SFT model from adapter {SFT_ADAPTER}...")
+# ── Caricamento modello ───────────────────────────────────────────────────────
+
+# Carica il modello base con l'adapter LoRA prodotto dall'SFT.
+# unsloth gestisce il caricamento in 4-bit e applica automaticamente l'adapter.
+print(f"Loading SFT model from {SFT_ADAPTER}...")
 model, tokenizer = FastLanguageModel.from_pretrained(
     model_name=SFT_ADAPTER,
     max_seq_length=MAX_SEQ_LEN,
     dtype=torch.bfloat16,
     load_in_4bit=True,
 )
-print("SFT model loaded (LoRA adapter attivo).")
 
-# Passa il modello in training mode (il from_pretrained carica in inference mode)
+# Attiva la modalità training e sblocca i parametri LoRA per l'aggiornamento GRPO
 model.train()
-
-# Rende trainable i parametri LoRA esistenti per il GRPO
 for name, param in model.named_parameters():
     if "lora_" in name:
         param.requires_grad_(True)
 
-# Abilita gradient checkpointing per ridurre memoria
+# Gradient checkpointing: ricalcola le attivazioni durante il backward
+# invece di tenerle in memoria, riducendo il consumo di VRAM
 model.enable_input_require_grads()
 
 trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -80,140 +75,158 @@ total     = sum(p.numel() for p in model.parameters())
 print(f"Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 
 
-# ========================
-# Patch unsloth compiled cache: fix batch-size mismatch in apply_rotary_pos_emb
-# Durante GRPO accumulated loss, cos/sin possono avere batch=0 per un chunk vuoto
-# mentre q_pass mantiene batch=1 da q. Il torch.cat fallisce senza questo fix.
-# ========================
+# ── Patch unsloth: fix rotary embedding ──────────────────────────────────────
+
+# Durante GRPO, la generazione usa batch=num_generations ma il backward usa batch=1.
+# Questo causa un mismatch nelle dimensioni di cos/sin nel rotary embedding.
+# La patch allinea q_pass e k_pass alla dimensione effettiva del batch.
 def _patch_unsloth_rotary():
-    import re as _re, pathlib as _pl
-    cache_file = _pl.Path("unsloth_compiled_cache/unsloth_compiled_module_qwen3_5.py")
+    import pathlib
+    cache_file = pathlib.Path("unsloth_compiled_cache/unsloth_compiled_module_qwen3_5.py")
     if not cache_file.exists():
         return
     src = cache_file.read_text(encoding="utf-8")
     old = "    q_embed = torch.cat([q_embed, q_pass], dim=-1)\n    k_embed = torch.cat([k_embed, k_pass], dim=-1)"
     new = "    q_embed = torch.cat([q_embed, q_pass[:q_embed.shape[0]]], dim=-1)\n    k_embed = torch.cat([k_embed, k_pass[:k_embed.shape[0]]], dim=-1)"
     if new in src:
-        print("Unsloth rotary patch already present.")
+        print("Unsloth rotary patch: already present.")
         return
     if old not in src:
-        return  # unknown state, don't touch
-    if old in src:
-        cache_file.write_text(src.replace(old, new, 1), encoding="utf-8")
-        print("Unsloth rotary patch applied.")
-    elif new in src:
-        print("Unsloth rotary patch already present.")
+        return
+    cache_file.write_text(src.replace(old, new, 1), encoding="utf-8")
+    print("Unsloth rotary patch: applied.")
 
 _patch_unsloth_rotary()
 
 
-# ========================
-# Fix Qwen3.5-VL rope_deltas stale batch-size bug con GRPO
-# Durante la generation GRPO usa batch=num_generations (es. 4). Il modello salva
-# rope_deltas.shape[0]=4. Nell'accumulated loss usa batch=1: 1//4=0 → delta vuoto
-# → position_ids con batch=0 → cos/sin con batch=0 → mismatch con q/k (batch=1).
-# Soluzione: hook pre-forward che azzera rope_deltas prima di ogni training step,
-# così compute_3d_position_ids ritorna None e il testo usa cache_position.
-# ========================
+# ── Fix rope_deltas per Qwen3.5 ──────────────────────────────────────────────
+
+# Qwen3.5 salva rope_deltas con batch=num_generations durante la generazione.
+# Quando il backward usa batch=1, il calcolo delle position_ids produce un
+# tensore vuoto, causando un crash. Questo hook azzera rope_deltas prima di
+# ogni forward pass in modo che vengano ricalcolati correttamente.
 def _rope_deltas_reset_hook(module, args, kwargs):
     if hasattr(module, "rope_deltas"):
         module.rope_deltas = None
 
-_rope_hook_registered = False
+registered = False
 for _name, _mod in model.named_modules():
     if hasattr(_mod, "compute_3d_position_ids") and hasattr(_mod, "rope_deltas"):
         _mod.register_forward_pre_hook(_rope_deltas_reset_hook, with_kwargs=True)
-        print(f"rope_deltas reset hook registrato su: {_name}")
-        _rope_hook_registered = True
+        print(f"rope_deltas hook registered on: {_name}")
+        registered = True
         break
 
-if not _rope_hook_registered:
-    print("WARN: rope_deltas reset hook NON registrato (modulo non trovato)")
+if not registered:
+    print("WARN: rope_deltas hook not registered (module not found)")
 
 
-# ========================
-# Dataset
-# ========================
+# ── Dataset ───────────────────────────────────────────────────────────────────
+
 print("Loading dataset...")
 dataset = load_from_disk("dataset_hf")
 
-
 def format_prompt(example):
-    """
-    Formatta l'esempio come prompt per GRPO.
-    Il modello genera la completion (codice VGDL) che viene poi valutata
-    dalle reward functions.
-    """
-    prompt = (
+    # Costruisce il prompt nel formato ChatML che il modello si aspetta.
+    # Il blocco <think> vuoto segue il pattern di Qwen3 per il reasoning.
+    return {"prompt": (
         f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
         f"<|im_start|>user\n{example['description'].strip()}<|im_end|>\n"
         f"<|im_start|>assistant\n<think>\n\n</think>\n"
-    )
-    return {"prompt": prompt}
-
+    )}
 
 dataset = dataset.map(format_prompt, remove_columns=["vgdl"])
-print(f"Train size: {len(dataset['train'])} | Test size: {len(dataset['test'])}")
+print(f"Train: {len(dataset['train'])} examples | Test: {len(dataset['test'])} examples")
 
 
-# ========================
-# GRPO Config
-# ========================
+# ── Progress bar ──────────────────────────────────────────────────────────────
+
+class TqdmProgressCallback(TrainerCallback):
+    """Mostra una barra di avanzamento con le metriche chiave ad ogni step."""
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        self._pbar = tqdm(
+            total=state.max_steps,
+            desc="GRPO",
+            unit="step",
+            dynamic_ncols=True,
+        )
+        self._postfix = {}
+
+    def on_step_end(self, args, state, control, **kwargs):
+        self._pbar.update(1)
+        self._pbar.set_postfix(self._postfix, refresh=False)
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs:
+            return
+        # Mostra le metriche più utili per capire la qualità del training
+        keys = ["loss", "reward", "kl", "grad_norm", "learning_rate"]
+        self._postfix = {
+            k: f"{logs[k]:.4f}" if isinstance(logs[k], float) else str(logs[k])
+            for k in keys if k in logs
+        }
+        self._pbar.set_postfix(self._postfix, refresh=True)
+
+    def on_train_end(self, args, state, control, **kwargs):
+        self._pbar.close()
+
+
+# ── GRPO Config ───────────────────────────────────────────────────────────────
+
 grpo_config = GRPOConfig(
     output_dir=OUTPUT_DIR,
     # Training
     num_train_epochs=3,
     per_device_train_batch_size=1,
-    gradient_accumulation_steps=8,      # effective batch = 8
+    gradient_accumulation_steps=4,  # batch effettivo = 1 * 3 generazioni * 4 accum = 12
     learning_rate=5e-6,
     lr_scheduler_type="cosine",
     warmup_steps=10,
     bf16=True,
     fp16=False,
-    # Logging & saving
+    optim="adamw_8bit",             # ~4x meno VRAM rispetto ad AdamW standard
+    # Logging & salvataggio
     logging_steps=5,
     save_strategy="epoch",
     report_to="none",
-    # GRPO-specific
-    num_generations=2,          # G: numero di completions per prompt per calcolare reward relativa
-    max_prompt_length=400,      # token massimi per il prompt
-    max_completion_length=512,  # token massimi per la completion (VGDL generato)
-    temperature=0.9,            # deve essere > 0 per l'esplorazione durante training
-    beta=0.01,                  # penalità KL (bassa per permettere divergenza dalla policy iniziale)
-    use_vllm=True,                   # usa vLLM per generazione efficiente (richiede installazione vllm)
-    vllm_gpu_memory_utilization=0.8,  # target utilizzo GPU per vLLM
+    # Dataloader asincrono: i worker pre-caricano i batch mentre la GPU lavora
+    dataloader_num_workers=2,
+    dataloader_pin_memory=True,
+    # GRPO: per ogni prompt genera 3 completions, calcola reward relativa e aggiorna
+    num_generations=3,
+    max_prompt_length=400,
+    max_completion_length=384,
+    temperature=0.9,
+    beta=0.01,                      # peso della penalità KL verso la policy iniziale
+    # vLLM disabilitato: Qwen3.5-4B ha un encoder visivo (SigLIP) non supportato
+    # da unsloth fast_inference, rendendo impossibile la condivisione dei pesi
+    # tra il modello di training e il motore vLLM.
+    use_vllm=False,
 )
 
 
-# ========================
-# GRPO Trainer
-# ========================
+# ── Training ──────────────────────────────────────────────────────────────────
+
 trainer = GRPOTrainer(
     model=model,
     reward_funcs=REWARD_FUNCTIONS,
     args=grpo_config,
     train_dataset=dataset["train"],
     processing_class=tokenizer,
+    callbacks=[TqdmProgressCallback()],
 )
 
-
-# ========================
-# Training
-# ========================
 print("Starting GRPO training...")
 train_result = trainer.train()
 
 trainer.save_model(OUTPUT_DIR)
 tokenizer.save_pretrained(OUTPUT_DIR)
 
-metrics = {
-    "train": train_result.metrics,
-    "history": trainer.state.log_history,
-}
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 metrics_path = os.path.join(OUTPUT_DIR, "grpo_training_metrics.json")
 with open(metrics_path, "w") as f:
-    json.dump(metrics, f, indent=2)
+    json.dump({"train": train_result.metrics, "history": trainer.state.log_history}, f, indent=2)
 
-print(f"GRPO training completato! Modello salvato in {OUTPUT_DIR}")
-print(f"Metriche salvate in {metrics_path}")
+print(f"Training complete. Model saved to {OUTPUT_DIR}")
+print(f"Metrics saved to {metrics_path}")

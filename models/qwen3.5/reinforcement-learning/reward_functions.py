@@ -15,6 +15,23 @@ import re
 # ========================
 # Ontologia VGDL (estratta da py-vgdl/vgdl/ontology.py)
 # ========================
+# Pre-compiled regex patterns (compilati una sola volta al modulo load, non ad ogni chiamata)
+_RE_SECTION_CACHE = {}
+
+def _section_re(section_name):
+    if section_name not in _RE_SECTION_CACHE:
+        _RE_SECTION_CACHE[section_name] = re.compile(rf'^\s*{section_name}\b', re.MULTILINE)
+    return _RE_SECTION_CACHE[section_name]
+
+_RE_SPRITE_CLASS    = re.compile(r'>\s*([A-Z][A-Za-z]+)')
+_RE_INTERACTION_SEC = re.compile(r'InteractionSet(.*?)(?=TerminationSet|LevelMapping|SpriteSet|\Z)', re.DOTALL)
+_RE_EFFECT          = re.compile(r'>\s*([a-z][A-Za-z]+)')
+_RE_TERM_SEC        = re.compile(r'TerminationSet(.*?)(?=InteractionSet|LevelMapping|SpriteSet|\Z)', re.DOTALL)
+_RE_TERM_COND       = re.compile(r'^\s+([A-Z][A-Za-z]+)', re.MULTILINE)
+_RE_EOS             = re.compile(r'\bEOS\b')
+_RE_BASIC_GAME_LINE = re.compile(r'BasicGame[^\n]*')
+_RE_PARAM_KEY       = re.compile(r'(\w+)\s*=')
+_RE_INVALID_BOUND   = {kw: re.compile(rf'\b{kw}\b', re.IGNORECASE) for kw in {"edge", "screen", "wall_bound", "boundary"}}
 
 VALID_SPRITE_CLASSES = {
     # Sprite statici / immovable
@@ -55,18 +72,31 @@ MANDATORY_SECTIONS = ["SpriteSet", "LevelMapping", "InteractionSet", "Terminatio
 # Keyword NON valide per il bordo dello schermo (si deve usare EOS)
 INVALID_BOUNDARY_KEYWORDS = {"edge", "screen", "wall_bound", "boundary"}
 
+# Parametri validi per la riga BasicGame
+VALID_BASIC_GAME_PARAMS = {"block_size", "fps", "num_sprites"}
+
 
 # ========================
 # Validazione VGDL su stringa
 # (adattamento di evaluation/check_vgdl_executability.py)
 # ========================
 
+# Singleton VGDLParser: evita di reinstanziare il parser (e ricaricare l'ontologia)
+# ad ogni completion. Il parser è stateless rispetto alle chiamate a parseGame.
+_VGDL_PARSER = None
+
+def _get_parser():
+    global _VGDL_PARSER
+    if _VGDL_PARSER is None:
+        from vgdl.core import VGDLParser  # type: ignore
+        _VGDL_PARSER = VGDLParser()
+    return _VGDL_PARSER
+
+
 def _parse_vgdl_string(vgdl_str: str):
     """Parsa una stringa VGDL. Restituisce (game | None, errori: list)."""
     try:
-        from vgdl.core import VGDLParser  # type: ignore
-        parser = VGDLParser()
-        game = parser.parseGame(vgdl_str.strip())
+        game = _get_parser().parseGame(vgdl_str.strip())
         return game, []
     except Exception as e:
         return None, [f"Parsing error: {e}"]
@@ -138,7 +168,7 @@ def reward_structure(completions, **kwargs):
         if text.strip().startswith("BasicGame"):
             score += 0.2
         for section in MANDATORY_SECTIONS:
-            if re.search(rf'^\s*{section}\b', text, re.MULTILINE):
+            if _section_re(section).search(text):
                 score += 0.2
         rewards.append(score)
     return rewards
@@ -153,7 +183,7 @@ def reward_valid_sprite_classes(completions, **kwargs):
     rewards = []
     for text in completions:
         # SpriteSet lines: "name > ClassName [params...]"
-        matches = re.findall(r'>\s*([A-Z][A-Za-z]+)', text)
+        matches = _RE_SPRITE_CLASS.findall(text)
         if not matches:
             rewards.append(0.5)
             continue
@@ -170,16 +200,12 @@ def reward_valid_interactions(completions, **kwargs):
     """
     rewards = []
     for text in completions:
-        inter_match = re.search(
-            r'InteractionSet(.*?)(?=TerminationSet|LevelMapping|SpriteSet|\Z)',
-            text, re.DOTALL
-        )
+        inter_match = _RE_INTERACTION_SEC.search(text)
         if not inter_match:
             rewards.append(0.5)
             continue
         section_text = inter_match.group(1)
-        # effetti iniziano con lettera minuscola dopo ">"
-        effects = re.findall(r'>\s*([a-z][A-Za-z]+)', section_text)
+        effects = _RE_EFFECT.findall(section_text)
         if not effects:
             rewards.append(0.5)
             continue
@@ -197,16 +223,12 @@ def reward_valid_terminations(completions, **kwargs):
     """
     rewards = []
     for text in completions:
-        term_match = re.search(
-            r'TerminationSet(.*?)(?=InteractionSet|LevelMapping|SpriteSet|\Z)',
-            text, re.DOTALL
-        )
+        term_match = _RE_TERM_SEC.search(text)
         if not term_match:
             rewards.append(0.5)
             continue
         section_text = term_match.group(1)
-        # condizioni iniziano con lettera maiuscola (indentate)
-        conditions = re.findall(r'^\s+([A-Z][A-Za-z]+)', section_text, re.MULTILINE)
+        conditions = _RE_TERM_COND.findall(section_text)
         if not conditions:
             rewards.append(0.5)
             continue
@@ -224,11 +246,8 @@ def reward_eos_boundary(completions, **kwargs):
     """
     rewards = []
     for text in completions:
-        has_eos = bool(re.search(r'\bEOS\b', text))
-        has_invalid = any(
-            bool(re.search(rf'\b{kw}\b', text, re.IGNORECASE))
-            for kw in INVALID_BOUNDARY_KEYWORDS
-        )
+        has_eos = bool(_RE_EOS.search(text))
+        has_invalid = any(rx.search(text) for rx in _RE_INVALID_BOUND.values())
         if has_invalid:
             rewards.append(0.0)
         elif has_eos:
@@ -238,12 +257,31 @@ def reward_eos_boundary(completions, **kwargs):
     return rewards
 
 
+def reward_no_undefined_params(completions, **kwargs):
+    """
+    Penalizza parametri non riconosciuti da py-vgdl nella riga BasicGame.
+    Score = -0.1 per ogni parametro sconosciuto trovato.
+    0.0 se la riga BasicGame non è presente o non ha parametri unknown.
+    """
+    rewards = []
+    for text in completions:
+        basic_game_match = _RE_BASIC_GAME_LINE.search(text)
+        if not basic_game_match:
+            rewards.append(0.0)
+            continue
+        found = _RE_PARAM_KEY.findall(basic_game_match.group())
+        unknown = [p for p in found if p not in VALID_BASIC_GAME_PARAMS]
+        rewards.append(-0.1 * len(unknown))
+    return rewards
+
+
 # Lista ordinata di reward functions (GRPOTrainer le somma automaticamente)
 REWARD_FUNCTIONS = [
-    reward_executability,        # peso implicito: 1x (il più importante)
-    reward_structure,            # peso implicito: 1x
-    reward_valid_sprite_classes, # peso implicito: 1x
-    reward_valid_interactions,   # peso implicito: 1x
-    reward_valid_terminations,   # peso implicito: 1x
-    reward_eos_boundary,         # peso implicito: 1x
+    reward_executability,          # peso implicito: 1x (il più importante)
+    reward_structure,              # peso implicito: 1x
+    reward_valid_sprite_classes,   # peso implicito: 1x
+    reward_valid_interactions,     # peso implicito: 1x
+    reward_valid_terminations,     # peso implicito: 1x
+    reward_eos_boundary,           # peso implicito: 1x
+    reward_no_undefined_params,    # penalità per parametri BasicGame non validi
 ]
